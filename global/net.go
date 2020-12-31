@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"fmt"
+	"github.com/guonaihong/gout"
+	"github.com/pkg/errors"
 	"io/ioutil"
 	"net"
 	"net/http"
@@ -26,7 +28,6 @@ var client = &http.Client{
 		DialContext: (&net.Dialer{
 			Timeout:   30 * time.Second,
 			KeepAlive: 30 * time.Second,
-			DualStack: true,
 		}).DialContext,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          100,
@@ -61,6 +62,21 @@ func GetBytes(url string) ([]byte, error) {
 		return unCom, err
 	}
 	return body, nil
+}
+
+func GetSliderTicket(raw, id string) (string, error) {
+	var rsp string
+	if err := gout.POST("https://api.shkong.com/gocqhttpapi/task").SetJSON(gout.H{
+		"id":  id,
+		"url": raw,
+	}).SetTimeout(time.Second * 35).BindBody(&rsp).Do(); err != nil {
+		return "", err
+	}
+	g := gjson.Parse(rsp)
+	if g.Get("error").Str != "" {
+		return "", errors.New(g.Get("error").Str)
+	}
+	return g.Get("ticket").Str, nil
 }
 
 func QQMusicSongInfo(id string) (gjson.Result, error) {

@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"encoding/base64"
 	"fmt"
+	"github.com/Mrs4s/MiraiGo/utils"
+	"github.com/gin-contrib/pprof"
 	"image"
 	"io/ioutil"
 	"net/http"
@@ -78,6 +80,11 @@ func (s *webServer) Run(addr string, cli *client.QQClient) *coolq.CQBot {
 	go func() {
 		//开启端口监听
 		if s.Conf.WebUi != nil && s.Conf.WebUi.Enabled {
+			if Debug {
+				pprof.Register(s.engine)
+				log.Debugf("pprof 性能分析服务已启动在 http://%v/debug/pprof, 如果有任何性能问题请下载报告并提交给开发者", addr)
+				time.Sleep(time.Second * 3)
+			}
 			log.Infof("Admin API 服务器已启动: %v", addr)
 			err := s.engine.Run(addr)
 			if err != nil {
@@ -106,33 +113,54 @@ func (s *webServer) Dologin() {
 	s.Console = bufio.NewReader(os.Stdin)
 	readLine := func() (str string) {
 		str, _ = s.Console.ReadString('\n')
+		str = strings.TrimSpace(str)
 		return
 	}
 	conf := GetConf()
 	cli := s.Cli
 	cli.AllowSlider = true
 	rsp, err := cli.Login()
+	count := 0
 	for {
 		global.Check(err)
 		var text string
 		if !rsp.Success {
 			switch rsp.Error {
 			case client.SliderNeededError:
-				if client.SystemDeviceInfo.Protocol == client.AndroidPhone {
-					log.Warnf("警告: Android Phone 强制要求暂不支持的滑条验证码, 请开启设备锁或切换到Watch协议验证通过后再使用.")
-					log.Infof("按 Enter 继续....")
-					readLine()
+				log.Warnf("登录需要滑条验证码, 请选择解决方案: ")
+				log.Warnf("1. 自行抓包. (推荐)")
+				log.Warnf("2. 使用Cef自动处理.")
+				log.Warnf("3. 不提交滑块并继续.(可能会导致上网环境异常错误)")
+				log.Warnf("详细信息请参考文档 -> https://github.com/Mrs4s/go-cqhttp/blob/master/docs/slider.md <-")
+				log.Warn("请输入(1 - 3): ")
+				text = readLine()
+				if strings.Contains(text, "1") {
+					log.Warnf("请用浏览器打开 -> %v <- 并获取Ticket.", rsp.VerifyUrl)
+					log.Warn("请输入Ticket： (Enter 提交)")
+					text = readLine()
+					rsp, err = cli.SubmitTicket(strings.TrimSpace(text))
+					continue
+				}
+				if strings.Contains(text, "3") {
+					cli.AllowSlider = false
+					cli.Disconnect()
+					rsp, err = cli.Login()
+					continue
+				}
+				id := utils.RandomStringRange(6, "0123456789")
+				log.Warnf("滑块ID为 %v 请在30S内处理.", id)
+				ticket, err := global.GetSliderTicket(rsp.VerifyUrl, id)
+				if err != nil {
+					log.Warnf("错误: " + err.Error())
 					os.Exit(0)
 				}
-				cli.AllowSlider = false
-				cli.Disconnect()
-				rsp, err = cli.Login()
+				rsp, err = cli.SubmitTicket(ticket)
 				continue
 			case client.NeedCaptcha:
 				_ = ioutil.WriteFile("captcha.jpg", rsp.CaptchaImage, 0644)
 				img, _, _ := image.Decode(bytes.NewReader(rsp.CaptchaImage))
 				fmt.Println(asciiart.New("image", img).Art)
-				if conf.WebUi.WebInput {
+				if conf.WebUi != nil && conf.WebUi.WebInput {
 					log.Warnf("请输入验证码 (captcha.jpg)： (http://%s:%d/admin/do_web_write 输入)", conf.WebUi.Host, conf.WebUi.WebUiPort)
 					text = <-WebInput
 				} else {
@@ -178,7 +206,7 @@ func (s *webServer) Dologin() {
 				return
 			case client.UnsafeDeviceError:
 				log.Warnf("账号已开启设备锁，请前往 -> %v <- 验证并重启Bot.", rsp.VerifyUrl)
-				if conf.WebUi.WebInput {
+				if conf.WebUi != nil && conf.WebUi.WebInput {
 					log.Infof(" (http://%s:%d/admin/do_web_write 确认后继续)....", conf.WebUi.Host, conf.WebUi.WebUiPort)
 					text = <-WebInput
 				} else {
@@ -192,6 +220,14 @@ func (s *webServer) Dologin() {
 				msg := rsp.ErrorMessage
 				if strings.Contains(msg, "版本") {
 					msg = "密码错误或账号被冻结"
+				}
+				if strings.Contains(msg, "上网环境") && count < 5 {
+					cli.Disconnect()
+					rsp, err = cli.Login()
+					count++
+					log.Warnf("错误: 当前上网环境异常. 将更换服务器并重试.")
+					time.Sleep(time.Second)
+					continue
 				}
 				log.Warnf("登录失败: %v", msg)
 				log.Infof("按 Enter 继续....")
@@ -224,6 +260,7 @@ func (s *webServer) Dologin() {
 	global.BootFilter()
 	global.InitCodec()
 	coolq.IgnoreInvalidCQCode = conf.IgnoreInvalidCQCode
+	coolq.SplitUrl = conf.FixUrl
 	coolq.ForceFragmented = conf.ForceFragmented
 	log.Info("资源初始化完成, 开始处理信息.")
 	log.Info("アトリは、高性能ですから!")
@@ -302,6 +339,10 @@ func AuthMiddleWare() gin.HandlerFunc {
 		// 放行所有OPTIONS方法，因为有的模板是要请求两次的
 		if c.Request.Method == "OPTIONS" {
 			c.AbortWithStatus(http.StatusNoContent)
+		}
+		if strings.Contains(c.Request.URL.Path, "debug") {
+			c.Next()
+			return
 		}
 		// 处理请求
 		if c.Request.Method != "GET" && c.Request.Method != "POST" {

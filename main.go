@@ -21,6 +21,7 @@ import (
 	"github.com/Mrs4s/go-cqhttp/server"
 	"github.com/guonaihong/gout"
 	"github.com/tidwall/gjson"
+	"golang.org/x/crypto/ssh/terminal"
 
 	"github.com/Mrs4s/MiraiGo/binary"
 	"github.com/Mrs4s/MiraiGo/client"
@@ -97,9 +98,8 @@ func init() {
 }
 
 func main() {
-	console := bufio.NewReader(os.Stdin)
-	var strKey string
-	var isFastStart bool = false
+	var byteKey []byte
+	var isFastStart = false
 	arg := os.Args
 	if len(arg) > 1 {
 		for i := range arg {
@@ -113,8 +113,7 @@ func main() {
 			case "key":
 				if len(arg) > i+1 {
 					b := []byte(arg[i+1])
-					b = append(b, 13, 10)
-					strKey = string(b[:])
+					byteKey = b
 				}
 			case "faststart":
 				isFastStart = true
@@ -214,7 +213,12 @@ func main() {
 		log.SetLevel(log.DebugLevel)
 		log.Warnf("已开启Debug模式.")
 		log.Debugf("开发交流群: 192548878")
+		server.Debug = true
+		if conf.WebUi == nil || !conf.WebUi.Enabled {
+			log.Warnf("警告: 在Debug模式下未启用WebUi服务, 将无法进行性能分析.")
+		}
 	}
+	log.Info("用户交流群: 721829413")
 	if !global.PathExists("device.json") {
 		log.Warn("虚拟设备信息不存在, 将自动生成随机设备.")
 		client.GenRandomDevice()
@@ -228,8 +232,8 @@ func main() {
 	}
 	if conf.EncryptPassword && conf.PasswordEncrypted == "" {
 		log.Infof("密码加密已启用, 请输入Key对密码进行加密: (Enter 提交)")
-		strKey, _ := console.ReadString('\n')
-		key := md5.Sum([]byte(strKey))
+		byteKey, _ := terminal.ReadPassword(int(os.Stdin.Fd()))
+		key := md5.Sum(byteKey)
 		if encrypted := EncryptPwd(conf.Password, key[:]); encrypted != "" {
 			conf.Password = ""
 			conf.PasswordEncrypted = encrypted
@@ -239,7 +243,7 @@ func main() {
 		}
 	}
 	if conf.PasswordEncrypted != "" {
-		if strKey == "" {
+		if len(byteKey) == 0 {
 			log.Infof("密码加密已启用, 请输入Key对密码进行解密以继续: (Enter 提交)")
 			cancel := make(chan struct{}, 1)
 			go func() {
@@ -252,12 +256,12 @@ func main() {
 					os.Exit(0)
 				}
 			}()
-			strKey, _ = console.ReadString('\n')
+			byteKey, _ = terminal.ReadPassword(int(os.Stdin.Fd()))
 			cancel <- struct{}{}
 		} else {
 			log.Infof("密码加密已启用, 使用运行时传递的参数进行解密，按 Ctrl+C 取消.")
 		}
-		key := md5.Sum([]byte(strKey))
+		key := md5.Sum(byteKey)
 		conf.Password = DecryptPwd(conf.PasswordEncrypted, key[:])
 	}
 	if !isFastStart {
