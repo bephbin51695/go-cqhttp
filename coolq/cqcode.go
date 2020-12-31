@@ -9,9 +9,10 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"math"
+	"math/rand"
 	"net/url"
 	"path"
-	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -23,11 +24,14 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+/*
 var matchReg = regexp.MustCompile(`\[CQ:\w+?.*?]`)
 var typeReg = regexp.MustCompile(`\[CQ:(\w+)`)
 var paramReg = regexp.MustCompile(`,([\w\-.]+?)=([^,\]]+)`)
+*/
 
 var IgnoreInvalidCQCode = false
+var SplitUrl = false
 
 type PokeElement struct {
 	Target int64
@@ -315,30 +319,74 @@ func ToStringMessage(e []message.IMessageElement, code int64, raw ...bool) (r st
 	return
 }
 
-func (bot *CQBot) ConvertStringMessage(m string, group bool) (r []message.IMessageElement) {
-	i := matchReg.FindAllStringSubmatchIndex(m, -1)
-	si := 0
-	for _, idx := range i {
-		if idx[0] > si {
-			text := m[si:idx[0]]
-			r = append(r, message.NewText(CQCodeUnescapeText(text)))
+func (bot *CQBot) ConvertStringMessage(msg string, group bool) (r []message.IMessageElement) {
+	index := 0
+	stat := 0
+	rMsg := []rune(msg)
+	var tempText, cqCode []rune
+	hasNext := func() bool {
+		return index < len(rMsg)
+	}
+	next := func() rune {
+		r := rMsg[index]
+		index++
+		return r
+	}
+	move := func(steps int) {
+		index += steps
+	}
+	peekN := func(count int) string {
+		lastIdx := int(math.Min(float64(index+count), float64(len(rMsg))))
+		return string(rMsg[index:lastIdx])
+	}
+	isCQCodeBegin := func(r rune) bool {
+		return r == '[' && peekN(3) == "CQ:"
+	}
+	saveTempText := func() {
+		if len(tempText) != 0 {
+			if SplitUrl {
+				for _, t := range global.SplitUrl(CQCodeUnescapeValue(string(tempText))) {
+					r = append(r, message.NewText(t))
+				}
+			} else {
+				r = append(r, message.NewText(CQCodeUnescapeValue(string(tempText))))
+			}
 		}
-		code := m[idx[0]:idx[1]]
-		si = idx[1]
-		t := typeReg.FindAllStringSubmatch(code, -1)[0][1]
-		ps := paramReg.FindAllStringSubmatch(code, -1)
-		d := make(map[string]string)
-		for _, p := range ps {
-			d[p[1]] = CQCodeUnescapeValue(p[2])
+		tempText = []rune{}
+		cqCode = []rune{}
+	}
+	saveCQCode := func() {
+		defer func() {
+			cqCode = []rune{}
+			tempText = []rune{}
+		}()
+		s := strings.SplitN(string(cqCode), ",", -1)
+		if len(s) == 0 {
+			return
 		}
-		if t == "reply" {
+		t := s[0]
+		params := make(map[string]string)
+		for i := 1; i < len(s); i++ {
+			p := s[i]
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+			data := strings.SplitN(p, "=", 2)
+			if len(data) == 2 {
+				params[data[0]] = CQCodeUnescapeValue(data[1])
+			} else {
+				params[p] = ""
+			}
+		}
+		if t == "reply" { // reply 特殊处理
 			if len(r) > 0 {
 				if _, ok := r[0].(*message.ReplyElement); ok {
 					log.Warnf("警告: 一条信息只能包含一个 Reply 元素.")
-					continue
+					return
 				}
 			}
-			mid, err := strconv.Atoi(d["id"])
+			mid, err := strconv.Atoi(params["id"])
 			if err == nil {
 				org := bot.GetMessage(int32(mid))
 				if org != nil {
@@ -350,19 +398,20 @@ func (bot *CQBot) ConvertStringMessage(m string, group bool) (r []message.IMessa
 							Elements: bot.ConvertStringMessage(org["message"].(string), group),
 						},
 					}, r...)
-					continue
+					return
 				}
 			}
 		}
-		elem, err := bot.ToElement(t, d, group)
+		elem, err := bot.ToElement(t, params, group)
 		if err != nil {
+			org := "[" + string(cqCode) + "]"
 			if !IgnoreInvalidCQCode {
-				log.Warnf("转换CQ码 %v 到MiraiGo Element时出现错误: %v 将原样发送.", code, err)
-				r = append(r, message.NewText(code))
+				log.Warnf("转换CQ码 %v 时出现错误: %v 将原样发送.", org, err)
+				r = append(r, message.NewText(org))
 			} else {
-				log.Warnf("转换CQ码 %v 到MiraiGo Element时出现错误: %v 将忽略.", code, err)
+				log.Warnf("转换CQ码 %v 时出现错误: %v 将忽略.", org, err)
 			}
-			continue
+			return
 		}
 		switch i := elem.(type) {
 		case message.IMessageElement:
@@ -371,9 +420,32 @@ func (bot *CQBot) ConvertStringMessage(m string, group bool) (r []message.IMessa
 			r = append(r, i...)
 		}
 	}
-	if si != len(m) {
-		r = append(r, message.NewText(CQCodeUnescapeText(m[si:])))
+	for hasNext() {
+		ch := next()
+		switch stat {
+		case 0:
+			if isCQCodeBegin(ch) {
+				saveTempText()
+				tempText = append(tempText, []rune("[CQ:")...)
+				move(3)
+				stat = 1
+			} else {
+				tempText = append(tempText, ch)
+			}
+		case 1:
+			if isCQCodeBegin(ch) {
+				move(-1)
+				stat = 0
+			} else if ch == ']' {
+				saveCQCode()
+				stat = 0
+			} else {
+				cqCode = append(cqCode, ch)
+				tempText = append(tempText, ch)
+			}
+		}
 	}
+	saveTempText()
 	return
 }
 
@@ -441,6 +513,13 @@ func (bot *CQBot) ConvertObjectMessage(m gjson.Result, group bool) (r []message.
 func (bot *CQBot) ToElement(t string, d map[string]string, group bool) (m interface{}, err error) {
 	switch t {
 	case "text":
+		if SplitUrl {
+			var ret []message.IMessageElement
+			for _, text := range global.SplitUrl(d["text"]) {
+				ret = append(ret, message.NewText(text))
+			}
+			return ret, nil
+		}
 		return message.NewText(d["text"]), nil
 	case "image":
 		img, err := bot.makeImageElem(d, group)
@@ -509,6 +588,9 @@ func (bot *CQBot) ToElement(t string, d map[string]string, group bool) (m interf
 	case "record":
 		f := d["file"]
 		data, err := global.FindFile(f, d["cache"], global.VOICE_PATH)
+		if err == global.ErrSyntax {
+			data, err = global.FindFile(f, d["cache"], global.VOICE_PATH_OLD)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -630,14 +712,12 @@ func (bot *CQBot) ToElement(t string, d map[string]string, group bool) (m interf
 	case "xml":
 		resId := d["resid"]
 		template := CQCodeEscapeValue(d["data"])
-		//println(template)
 		i, _ := strconv.ParseInt(resId, 10, 64)
 		msg := message.NewRichXml(template, i)
 		return msg, nil
 	case "json":
 		resId := d["resid"]
 		i, _ := strconv.ParseInt(resId, 10, 64)
-		log.Warnf("json msg=%s", d["data"])
 		if i == 0 {
 			//默认情况下走小程序通道
 			msg := message.NewLightApp(CQCodeUnescapeValue(d["data"]))
@@ -755,6 +835,9 @@ func (bot *CQBot) makeImageElem(d map[string]string, group bool) (message.IMessa
 		return message.NewImage(b), nil
 	}
 	rawPath := path.Join(global.IMAGE_PATH, f)
+	if !global.PathExists(rawPath) && global.PathExists(path.Join(global.IMAGE_PATH_OLD, f)) {
+		rawPath = path.Join(global.IMAGE_PATH_OLD, f)
+	}
 	if !global.PathExists(rawPath) && global.PathExists(rawPath+".cqimg") {
 		rawPath += ".cqimg"
 	}
@@ -803,7 +886,7 @@ func (bot *CQBot) makeImageElem(d map[string]string, group bool) (message.IMessa
 			return nil, errors.New("invalid hash")
 		}
 		if group {
-			rsp, err := bot.Client.QueryGroupImage(1, hash, size)
+			rsp, err := bot.Client.QueryGroupImage(int64(rand.Uint32()), hash, size)
 			if err != nil {
 				if url != "" {
 					return bot.makeImageElem(map[string]string{"file": url}, group)
@@ -812,7 +895,7 @@ func (bot *CQBot) makeImageElem(d map[string]string, group bool) (message.IMessa
 			}
 			return rsp, nil
 		}
-		rsp, err := bot.Client.QueryFriendImage(1, hash, size)
+		rsp, err := bot.Client.QueryFriendImage(int64(rand.Uint32()), hash, size)
 		if err != nil {
 			if url != "" {
 				return bot.makeImageElem(map[string]string{"file": url}, group)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -316,7 +317,7 @@ func (s *websocketServer) listenApi(c *websocketConn) {
 func (c *websocketConn) handleRequest(bot *coolq.CQBot, payload []byte) {
 	defer func() {
 		if err := recover(); err != nil {
-			log.Printf("处置WS命令时发生无法恢复的异常：%v", err)
+			log.Printf("处置WS命令时发生无法恢复的异常：%v\n%s", err, debug.Stack())
 			c.Close()
 		}
 	}()
@@ -326,6 +327,14 @@ func (c *websocketConn) handleRequest(bot *coolq.CQBot, payload []byte) {
 	log.Debugf("WS接收到API调用: %v 参数: %v", t, j.Get("params").Raw)
 	if f, ok := wsApi[t]; ok {
 		ret := f(bot, j.Get("params"))
+		if j.Get("echo").Exists() {
+			ret["echo"] = j.Get("echo").Value()
+		}
+		c.Lock()
+		defer c.Unlock()
+		_ = c.WriteJSON(ret)
+	} else {
+		ret := coolq.Failed(1404, "API_NOT_FOUND", "API不存在")
 		if j.Get("echo").Exists() {
 			ret["echo"] = j.Get("echo").Value()
 		}
@@ -370,7 +379,7 @@ var wsApi = map[string]func(*coolq.CQBot, gjson.Result) coolq.MSG{
 		return bot.CQGetGroupList(p.Get("no_cache").Bool())
 	},
 	"get_group_info": func(bot *coolq.CQBot, p gjson.Result) coolq.MSG {
-		return bot.CQGetGroupInfo(p.Get("group_id").Int())
+		return bot.CQGetGroupInfo(p.Get("group_id").Int(), p.Get("no_cache").Bool())
 	},
 	"get_group_member_list": func(bot *coolq.CQBot, p gjson.Result) coolq.MSG {
 		return bot.CQGetGroupMemberList(p.Get("group_id").Int(), p.Get("no_cache").Bool())
@@ -472,7 +481,11 @@ var wsApi = map[string]func(*coolq.CQBot, gjson.Result) coolq.MSG{
 		return bot.CQGetImage(p.Get("file").Str)
 	},
 	"get_forward_msg": func(bot *coolq.CQBot, p gjson.Result) coolq.MSG {
-		return bot.CQGetForwardMessage(p.Get("message_id").Str)
+		id := p.Get("message_id").Str
+		if id == "" {
+			id = p.Get("id").Str
+		}
+		return bot.CQGetForwardMessage(id)
 	},
 	"get_msg": func(bot *coolq.CQBot, p gjson.Result) coolq.MSG {
 		return bot.CQGetMessage(int32(p.Get("message_id").Int()))
@@ -532,11 +545,31 @@ var wsApi = map[string]func(*coolq.CQBot, gjson.Result) coolq.MSG{
 	".ocr_image": func(bot *coolq.CQBot, p gjson.Result) coolq.MSG {
 		return bot.CQOcrImage(p.Get("image").Str)
 	},
+	"ocr_image": func(bot *coolq.CQBot, p gjson.Result) coolq.MSG {
+		return bot.CQOcrImage(p.Get("image").Str)
+	},
+	"get_group_at_all_remain": func(bot *coolq.CQBot, p gjson.Result) coolq.MSG {
+		return bot.CQGetAtAllRemain(p.Get("group_id").Int())
+	},
 	".get_word_slices": func(bot *coolq.CQBot, p gjson.Result) coolq.MSG {
 		return bot.CQGetWordSlices(p.Get("content").Str)
 	},
 	"set_group_portrait": func(bot *coolq.CQBot, p gjson.Result) coolq.MSG {
 		return bot.CQSetGroupPortrait(p.Get("group_id").Int(), p.Get("file").String(), p.Get("cache").String())
+	},
+	"set_group_anonymous_ban": func(bot *coolq.CQBot, p gjson.Result) coolq.MSG {
+		obj := p.Get("anonymous")
+		flag := p.Get("anonymous_flag")
+		if !flag.Exists() {
+			flag = p.Get("flag")
+		}
+		if !flag.Exists() && !obj.Exists() {
+			return coolq.Failed(100, "FLAG_NOT_FOUND", "flag未找到")
+		}
+		if !flag.Exists() {
+			flag = obj.Get("flag")
+		}
+		return bot.CQSetGroupAnonymousBan(p.Get("group_id").Int(), flag.String(), int32(p.Get("duration").Int()))
 	},
 	".handle_quick_operation": func(bot *coolq.CQBot, p gjson.Result) coolq.MSG {
 		return bot.CQHandleQuickOperation(p.Get("context"), p.Get("operation"))
