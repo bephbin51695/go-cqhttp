@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"path"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -18,7 +19,6 @@ import (
 
 	jsoniter "github.com/json-iterator/go"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
 )
 
 var json = jsoniter.ConfigCompatibleWithStandardLibrary
@@ -88,7 +88,7 @@ func NewQQBot(cli *client.QQClient, conf *global.JsonConfig) *CQBot {
 				"self_id":         bot.Client.Uin,
 				"post_type":       "meta_event",
 				"meta_event_type": "heartbeat",
-				"status":          nil,
+				"status":          bot.CQGetStatus()["data"],
 				"interval":        1000 * i,
 			})
 		}
@@ -222,7 +222,13 @@ func (bot *CQBot) SendGroupMessage(groupId int64, m *message.SendingMessage) int
 	ret := bot.Client.SendGroupMessage(groupId, m, ForceFragmented)
 	if ret == nil || ret.Id == -1 {
 		log.Warnf("群消息发送失败: 账号可能被风控.")
-		return -1
+		if !ForceFragmented {
+			log.Warnf("将尝试分片发送...")
+			ret = bot.Client.SendGroupMessage(groupId, m, true)
+		}
+		if ret == nil || ret.Id == -1 {
+			return -1
+		}
 	}
 	return bot.InsertGroupMessage(ret)
 }
@@ -392,22 +398,24 @@ func (bot *CQBot) Release() {
 }
 
 func (bot *CQBot) dispatchEventMessage(m MSG) {
-	payload := gjson.Parse(m.ToJson())
-	filter := global.EventFilter
-	if filter != nil && (*filter).Eval(payload) == false {
+	if global.EventFilter != nil && global.EventFilter.Eval(global.MSG(m)) == false {
 		log.Debug("Event filtered!")
 		return
 	}
 	for _, f := range bot.events {
-		fn := f
-		go func() {
+		go func(fn func(MSG)) {
+			defer func() {
+				if pan := recover(); pan != nil {
+					log.Warnf("处理事件 %v 时出现错误: %v \n%s", m, pan, debug.Stack())
+				}
+			}()
 			start := time.Now()
 			fn(m)
 			end := time.Now()
 			if end.Sub(start) > time.Second*5 {
 				log.Debugf("警告: 事件处理耗时超过 5 秒 (%v), 请检查应用是否有堵塞.", end.Sub(start))
 			}
-		}()
+		}(f)
 	}
 }
 
