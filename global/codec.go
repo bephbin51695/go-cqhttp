@@ -5,34 +5,35 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"os/exec"
 	"path"
-	"sync"
 
+	"github.com/Mrs4s/go-cqhttp/global/codec"
 	log "github.com/sirupsen/logrus"
-	"github.com/wdvxdr1123/go-silk/silk"
 )
 
-var codec silk.Encoder
-var useCodec = true
-var once sync.Once
+var useSilkCodec = true
 
+//InitCodec 初始化Silk编码器
 func InitCodec() {
-	once.Do(func() {
-		log.Info("正在加载silk编码器...")
-		err := codec.Init("data/cache", "codec")
-		if err != nil {
-			log.Error(err)
-			useCodec = false
-		}
-	})
+	log.Info("正在加载silk编码器...")
+	err := codec.Init()
+	if err != nil {
+		log.Error(err)
+		useSilkCodec = false
+	}
 }
 
-func Encoder(data []byte) ([]byte, error) {
-	if useCodec == false {
+//EncoderSilk 将音频编码为Silk
+func EncoderSilk(data []byte) ([]byte, error) {
+	if !useSilkCodec {
 		return nil, errors.New("no silk encoder")
 	}
 	h := md5.New()
-	h.Write(data)
+	_, err := h.Write(data)
+	if err != nil {
+		return nil, err
+	}
 	tempName := fmt.Sprintf("%x", h.Sum(nil))
 	if silkPath := path.Join("data/cache", tempName+".silk"); PathExists(silkPath) {
 		return ioutil.ReadFile(silkPath)
@@ -42,4 +43,21 @@ func Encoder(data []byte) ([]byte, error) {
 		return nil, err
 	}
 	return slk, nil
+}
+
+//EncodeMP4 将给定视频文件编码为MP4
+func EncodeMP4(src string, dst string) error { //        -y 覆盖文件
+	cmd1 := exec.Command("ffmpeg", "-i", src, "-y", "-c", "copy", "-map", "0", dst)
+	err := cmd1.Run()
+	if err != nil {
+		cmd2 := exec.Command("ffmpeg", "-i", src, "-y", "-c:v", "h264", "-c:a", "mp3", dst)
+		return cmd2.Run()
+	}
+	return err
+}
+
+//ExtractCover 获取给定视频文件的Cover
+func ExtractCover(src string, target string) error {
+	cmd := exec.Command("ffmpeg", "-i", src, "-y", "-r", "1", "-f", "image2", target)
+	return cmd.Run()
 }
