@@ -90,7 +90,8 @@ func (s *httpServer) Run(addr, authToken string, bot *coolq.CQBot) {
 		}
 		if err := s.Http.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Error(err)
-			log.Infof("请检查端口是否被占用.")
+			log.Infof("HTTP 服务启动失败, 请检查端口是否被占用.")
+			log.Warnf("将在五秒后退出.")
 			time.Sleep(time.Second * 5)
 			os.Exit(1)
 		}
@@ -122,7 +123,11 @@ func (c *httpClient) onBotPushEvent(m coolq.MSG) {
 		}
 		if c.secret != "" {
 			mac := hmac.New(sha1.New, []byte(c.secret))
-			mac.Write([]byte(m.ToJson()))
+			_, err := mac.Write([]byte(m.ToJson()))
+			if err != nil {
+				log.Error(err)
+				return nil
+			}
 			h["X-Signature"] = "sha1=" + hex.EncodeToString(mac.Sum(nil))
 		}
 		return h
@@ -416,6 +421,16 @@ func SetGroupAnonymousBan(s *httpServer, c *gin.Context) {
 	c.JSON(200, s.bot.CQSetGroupAnonymousBan(gid, flag, int32(d)))
 }
 
+func GetGroupMessageHistory(s *httpServer, c *gin.Context) {
+	gid, _ := strconv.ParseInt(getParam(c, "group_id"), 10, 64)
+	seq, _ := strconv.ParseInt(getParam(c, "message_seq"), 10, 64)
+	c.JSON(200, s.bot.CQGetGroupMessageHistory(gid, seq))
+}
+
+func GetOnlineClients(s *httpServer, c *gin.Context) {
+	c.JSON(200, s.bot.CQGetOnlineClients(getParamOrDefault(c, "no_cache", "false") == "true"))
+}
+
 func HandleQuickOperation(s *httpServer, c *gin.Context) {
 	if c.Request.Method != "POST" {
 		c.AbortWithStatus(404)
@@ -425,6 +440,33 @@ func HandleQuickOperation(s *httpServer, c *gin.Context) {
 		body := i.(gjson.Result)
 		c.JSON(200, s.bot.CQHandleQuickOperation(body.Get("context"), body.Get("operation")))
 	}
+}
+
+func DownloadFile(s *httpServer, c *gin.Context) {
+	url := getParam(c, "url")
+	tc, _ := strconv.Atoi(getParam(c, "thread_count"))
+	h, t := getParamWithType(c, "headers")
+	headers := map[string]string{}
+	if t == gjson.Null || t == gjson.String {
+		lines := strings.Split(h, "\r\n")
+		for _, sub := range lines {
+			str := strings.SplitN(sub, "=", 2)
+			if len(str) == 2 {
+				headers[str[0]] = str[1]
+			}
+		}
+	}
+	if t == gjson.JSON {
+		arr := gjson.Parse(h)
+		for _, sub := range arr.Array() {
+			str := strings.SplitN(sub.String(), "=", 2)
+			if len(str) == 2 {
+				headers[str[0]] = str[1]
+			}
+		}
+	}
+	println(url, tc, h, t)
+	c.JSON(200, s.bot.CQDownloadFile(url, headers, tc))
 }
 
 func OcrImage(s *httpServer, c *gin.Context) {
@@ -534,10 +576,13 @@ var httpApi = map[string]func(s *httpServer, c *gin.Context){
 	"reload_event_filter":        ReloadEventFilter,
 	"set_group_portrait":         SetGroupPortrait,
 	"set_group_anonymous_ban":    SetGroupAnonymousBan,
+	"get_group_msg_history":      GetGroupMessageHistory,
+	"download_file":              DownloadFile,
 	".handle_quick_operation":    HandleQuickOperation,
 	".ocr_image":                 OcrImage,
 	"ocr_image":                  OcrImage,
 	"get_group_at_all_remain":    GetGroupAtAllRemain,
+	"get_online_clients":         GetOnlineClients,
 	".get_word_slices":           GetWordSlices,
 }
 
@@ -547,9 +592,7 @@ func (s *httpServer) ShutDown() {
 	if err := s.Http.Shutdown(ctx); err != nil {
 		log.Fatal("http Server Shutdown:", err)
 	}
-	select {
-	case <-ctx.Done():
-		log.Println("timeout of 5 seconds.")
-	}
+	<-ctx.Done()
+	log.Println("timeout of 5 seconds.")
 	log.Println("http Server exiting")
 }

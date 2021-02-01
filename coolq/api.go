@@ -1,9 +1,13 @@
 package coolq
 
 import (
+	"crypto/md5"
+	"encoding/hex"
 	"io/ioutil"
+	"math"
 	"os"
 	"path"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -257,10 +261,11 @@ func (bot *CQBot) CQSendGroupForwardMessage(groupId int64, m gjson.Result) MSG {
 					SenderId:   sender.Uin,
 					SenderName: (&sender).DisplayName(),
 					Time: func() int32 {
-						if hasCustom {
+						msgTime := m["time"].(int32)
+						if hasCustom && msgTime == 0 {
 							return int32(ts.Unix())
 						}
-						return m["time"].(int32)
+						return msgTime
 					}(),
 					Message: bot.ConvertStringMessage(m["message"].(string), true),
 				})
@@ -270,6 +275,10 @@ func (bot *CQBot) CQSendGroupForwardMessage(groupId int64, m gjson.Result) MSG {
 			return
 		}
 		uin, _ := strconv.ParseInt(e.Get("data.uin").Str, 10, 64)
+		msgTime, err := strconv.ParseInt(e.Get("data.time").Str, 10, 64)
+		if err != nil {
+			msgTime = ts.Unix()
+		}
 		name := e.Get("data.name").Str
 		c := e.Get("data.content")
 		if c.IsArray() {
@@ -289,7 +298,7 @@ func (bot *CQBot) CQSendGroupForwardMessage(groupId int64, m gjson.Result) MSG {
 				nodes = append(nodes, &message.ForwardNode{
 					SenderId:   uin,
 					SenderName: name,
-					Time:       int32(ts.Unix()),
+					Time:       int32(msgTime),
 					Message:    []message.IMessageElement{bot.Client.UploadGroupForwardMessage(groupId, &message.ForwardMessage{Nodes: taowa})},
 				})
 				return
@@ -299,10 +308,19 @@ func (bot *CQBot) CQSendGroupForwardMessage(groupId int64, m gjson.Result) MSG {
 		if uin != 0 && name != "" && len(content) > 0 {
 			var newElem []message.IMessageElement
 			for _, elem := range content {
-				if img, ok := elem.(*message.ImageElement); ok {
-					gm, err := bot.Client.UploadGroupImage(groupId, img.Data)
+				if img, ok := elem.(*LocalImageElement); ok {
+					gm, err := bot.UploadLocalImageAsGroup(groupId, img)
 					if err != nil {
 						log.Warnf("警告：群 %v 图片上传失败: %v", groupId, err)
+						continue
+					}
+					newElem = append(newElem, gm)
+					continue
+				}
+				if video, ok := elem.(*LocalVideoElement); ok {
+					gm, err := bot.UploadLocalVideo(groupId, video)
+					if err != nil {
+						log.Warnf("警告：群 %v 视频上传失败: %v", groupId, err)
 						continue
 					}
 					newElem = append(newElem, gm)
@@ -313,7 +331,7 @@ func (bot *CQBot) CQSendGroupForwardMessage(groupId int64, m gjson.Result) MSG {
 			nodes = append(nodes, &message.ForwardNode{
 				SenderId:   uin,
 				SenderName: name,
-				Time:       int32(ts.Unix()),
+				Time:       int32(msgTime),
 				Message:    newElem,
 			})
 			return
@@ -331,7 +349,7 @@ func (bot *CQBot) CQSendGroupForwardMessage(groupId int64, m gjson.Result) MSG {
 	if len(sendNodes) > 0 {
 		gm := bot.Client.SendGroupForwardMessage(groupId, &message.ForwardMessage{Nodes: sendNodes})
 		return OK(MSG{
-			"message_id": ToGlobalId(groupId, gm.Id),
+			"message_id": bot.InsertGroupMessage(gm),
 		})
 	}
 	return Failed(100)
@@ -342,7 +360,7 @@ func (bot *CQBot) CQSendPrivateMessage(userId int64, i interface{}, autoEscape b
 	var str string
 	if m, ok := i.(gjson.Result); ok {
 		if m.Type == gjson.JSON {
-			elem := bot.ConvertObjectMessage(m, true)
+			elem := bot.ConvertObjectMessage(m, false)
 			mid := bot.SendPrivateMessage(userId, &message.SendingMessage{Elements: elem})
 			if mid == -1 {
 				return Failed(100, "SEND_MSG_API_ERROR", "请参考输出")
@@ -646,11 +664,15 @@ func (bot *CQBot) CQGetStrangerInfo(userId int64) MSG {
 	return OK(MSG{
 		"user_id":  info.Uin,
 		"nickname": info.Nickname,
+		"qid":      info.Qid,
 		"sex": func() string {
 			if info.Sex == 1 {
 				return "female"
+			} else if info.Sex == 0 {
+				return "male"
 			}
-			return "male"
+			// unknown = 0x2
+			return "unknown"
 		}(),
 		"age":        info.Age,
 		"level":      info.Level,
@@ -717,10 +739,10 @@ func (bot *CQBot) CQHandleQuickOperation(context, operation gjson.Result) MSG {
 }
 
 func (bot *CQBot) CQGetImage(file string) MSG {
-	if !global.PathExists(path.Join(global.IMAGE_PATH, file)) {
+	if !global.PathExists(path.Join(global.ImagePath, file)) {
 		return Failed(100)
 	}
-	if b, err := ioutil.ReadFile(path.Join(global.IMAGE_PATH, file)); err == nil {
+	if b, err := ioutil.ReadFile(path.Join(global.ImagePath, file)); err == nil {
 		r := binary.NewReader(b)
 		r.ReadBytes(16)
 		msg := MSG{
@@ -728,7 +750,7 @@ func (bot *CQBot) CQGetImage(file string) MSG {
 			"filename": r.ReadString(),
 			"url":      r.ReadString(),
 		}
-		local := path.Join(global.CACHE_PATH, file+"."+path.Ext(msg["filename"].(string)))
+		local := path.Join(global.CachePath, file+"."+path.Ext(msg["filename"].(string)))
 		if !global.PathExists(local) {
 			if data, err := global.GetBytes(msg["url"].(string)); err == nil {
 				_ = ioutil.WriteFile(local, data, 0644)
@@ -739,6 +761,25 @@ func (bot *CQBot) CQGetImage(file string) MSG {
 	} else {
 		return Failed(100, "LOAD_FILE_ERROR", err.Error())
 	}
+}
+
+func (bot *CQBot) CQDownloadFile(url string, headers map[string]string, threadCount int) MSG {
+	hash := md5.Sum([]byte(url))
+	file := path.Join(global.CachePath, hex.EncodeToString(hash[:])+".cache")
+	if global.PathExists(file) {
+		if err := os.Remove(file); err != nil {
+			log.Warnf("删除缓存文件 %v 时出现错误: %v", file, err)
+			return Failed(100, "DELETE_FILE_ERROR", err.Error())
+		}
+	}
+	if err := global.DownloadFileMultiThreading(url, file, 0, threadCount, headers); err != nil {
+		log.Warnf("下载链接 %v 时出现错误: %v", url, err)
+		return Failed(100, "DOWNLOAD_FILE_ERROR", err.Error())
+	}
+	abs, _ := filepath.Abs(file)
+	return OK(MSG{
+		"file": abs,
+	})
 }
 
 func (bot *CQBot) CQGetForwardMessage(resId string) MSG {
@@ -772,16 +813,23 @@ func (bot *CQBot) CQGetMessage(messageId int32) MSG {
 	gid, isGroup := msg["group"]
 	raw := msg["message"].(string)
 	return OK(MSG{
-		"message_id": messageId,
-		"real_id":    msg["message-id"],
-		"group":      isGroup,
-		"group_id":   gid,
+		"message_id":  messageId,
+		"real_id":     msg["message-id"],
+		"message_seq": msg["message-id"],
+		"group":       isGroup,
+		"group_id":    gid,
+		"message_type": func() string {
+			if isGroup {
+				return "group"
+			}
+			return "private"
+		}(),
 		"sender": MSG{
 			"user_id":  sender.Uin,
 			"nickname": sender.Nickname,
 		},
 		"time":        msg["time"],
-		"message_raw": raw,
+		"raw_message": raw,
 		"message": ToFormattedMessage(bot.ConvertStringMessage(raw, isGroup), func() int64 {
 			if isGroup {
 				return gid.(int64)
@@ -800,6 +848,57 @@ func (bot *CQBot) CQGetGroupSystemMessages() MSG {
 	return OK(msg)
 }
 
+func (bot *CQBot) CQGetGroupMessageHistory(groupId int64, seq int64) MSG {
+	if g := bot.Client.FindGroup(groupId); g == nil {
+		return Failed(100, "GROUP_NOT_FOUND", "群聊不存在")
+	}
+	if seq == 0 {
+		g, err := bot.Client.GetGroupInfo(groupId)
+		if err != nil {
+			return Failed(100, "GROUP_INFO_API_ERROR", err.Error())
+		}
+		seq = g.LastMsgSeq
+	}
+	msg, err := bot.Client.GetGroupMessages(groupId, int64(math.Max(float64(seq-19), 1)), seq)
+	if err != nil {
+		log.Warnf("获取群历史消息失败: %v", err)
+		return Failed(100, "MESSAGES_API_ERROR", err.Error())
+	}
+	var ms []MSG
+	for _, m := range msg {
+		id := m.Id
+		if bot.db != nil {
+			id = bot.InsertGroupMessage(m)
+		}
+		t := bot.formatGroupMessage(m)
+		t["message_id"] = id
+		ms = append(ms, t)
+	}
+	return OK(MSG{
+		"messages": ms,
+	})
+}
+
+func (bot *CQBot) CQGetOnlineClients(noCache bool) MSG {
+	if noCache {
+		if err := bot.Client.RefreshStatus(); err != nil {
+			log.Warnf("刷新客户端状态时出现问题 %v", err)
+			return Failed(100, "REFRESH_STATUS_ERROR", err.Error())
+		}
+	}
+	var d []MSG
+	for _, oc := range bot.Client.OnlineClients {
+		d = append(d, MSG{
+			"app_id":      oc.AppId,
+			"device_name": oc.DeviceName,
+			"device_kind": oc.DeviceKind,
+		})
+	}
+	return OK(MSG{
+		"clients": d,
+	})
+}
+
 func (bot *CQBot) CQCanSendImage() MSG {
 	return OK(MSG{"yes": true})
 }
@@ -809,7 +908,7 @@ func (bot *CQBot) CQCanSendRecord() MSG {
 }
 
 func (bot *CQBot) CQOcrImage(imageId string) MSG {
-	img, err := bot.makeImageElem(map[string]string{"file": imageId}, true)
+	img, err := bot.makeImageOrVideoElem(map[string]string{"file": imageId}, false, true)
 	if err != nil {
 		log.Warnf("load image error: %v", err)
 		return Failed(100, "LOAD_FILE_ERROR", err.Error())
@@ -829,7 +928,7 @@ func (bot *CQBot) CQReloadEventFilter() MSG {
 
 func (bot *CQBot) CQSetGroupPortrait(groupId int64, file, cache string) MSG {
 	if g := bot.Client.FindGroup(groupId); g != nil {
-		img, err := global.FindFile(file, cache, global.IMAGE_PATH)
+		img, err := global.FindFile(file, cache, global.ImagePath)
 		if err != nil {
 			log.Warnf("set group portrait error: %v", err)
 			return Failed(100, "LOAD_FILE_ERROR", err.Error())
@@ -920,11 +1019,19 @@ func Failed(code int, msg ...string) MSG {
 
 func convertGroupMemberInfo(groupId int64, m *client.GroupMemberInfo) MSG {
 	return MSG{
-		"group_id":       groupId,
-		"user_id":        m.Uin,
-		"nickname":       m.Nickname,
-		"card":           m.CardName,
-		"sex":            "unknown",
+		"group_id": groupId,
+		"user_id":  m.Uin,
+		"nickname": m.Nickname,
+		"card":     m.CardName,
+		"sex": func() string {
+			if m.Gender == 1 {
+				return "female"
+			} else if m.Gender == 0 {
+				return "male"
+			}
+			// unknown = 0xff
+			return "unknown"
+		}(),
 		"age":            0,
 		"area":           "",
 		"join_time":      m.JoinTime,
