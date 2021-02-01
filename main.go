@@ -22,7 +22,8 @@ import (
 	"github.com/Mrs4s/go-cqhttp/server"
 	"github.com/guonaihong/gout"
 	"github.com/tidwall/gjson"
-	"golang.org/x/term"
+  "golang.org/x/term"
+
 
 	"github.com/Mrs4s/MiraiGo/binary"
 	"github.com/Mrs4s/MiraiGo/client"
@@ -78,7 +79,7 @@ func init() {
 		TimestampFormat: "2006-01-02 15:04:05",
 		LogFormat:       "[%time%] [%lvl%]: %msg% \n",
 	}
-	w, err := rotatelogs.New(path.Join("logs", "%Y-%m-%d.log"), rotatelogs.WithRotationTime(time.Hour*24))
+	w, err := rotatelogs.New(path.Join("logs", "%Y-%m-%d.log"), rotatelogs.WithRotationTime(time.Hour*24), rotatelogs.WithMaxAge(time.Hour*24*35))
 	if err != nil {
 		log.Errorf("rotatelogs init err: %v", err)
 		panic(err)
@@ -114,7 +115,6 @@ func init() {
 }
 
 func main() {
-
 	var byteKey []byte
 	arg := os.Args
 	if len(arg) > 1 {
